@@ -85,6 +85,7 @@ git -C "$SDK_ROOT" apply "$WORKSPACE/stale-cache.patch"
 
 cd "$SDK_ROOT"
 bash scripts/bootstrap.sh
+source scripts/activate.sh
 
 gn_args=(
     'matter_log_json_payload_hex=true'
