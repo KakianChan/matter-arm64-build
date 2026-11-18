@@ -85,6 +85,7 @@ git -C "$SDK_ROOT" apply "$WORKSPACE/stale-cache.patch"
 
 cd "$SDK_ROOT"
 bash scripts/bootstrap.sh
+export PW_ENVIRONMENT_ROOT="$SDK_ROOT/.environment"
 source scripts/activate.sh
 
 gn_args=(
