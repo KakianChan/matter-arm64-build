@@ -1,0 +1,27 @@
+name: Build ARM64 Python controller
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out builder repository
+        uses: actions/checkout@v4
+
+      - name: Build patched _ChipDeviceCtrl.so
+        run: ./build.sh
+
+      - name: Upload controller artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chip-device-controller-arm64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14

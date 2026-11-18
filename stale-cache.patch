@@ -1,0 +1,1354 @@
+diff --git a/src/app/CASESessionManager.cpp b/src/app/CASESessionManager.cpp
+index dd2fdcd16b..4467f44d57 100644
+--- a/src/app/CASESessionManager.cpp
++++ b/src/app/CASESessionManager.cpp
+@@ -40,13 +40,14 @@ void CASESessionManager::FindOrEstablishSession(const ScopedNodeId & peerId, Cal
+                                                 uint8_t attemptCount, Callback::Callback<OnDeviceConnectionRetry> * onRetry,
+ #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+                                                 TransportPayloadCapability transportPayloadCapability,
+-                                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult)
++                                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult,
++                                                bool forceFreshAddressResolve)
+ {
+     FindOrEstablishSessionHelper(peerId, onConnection, onFailure, nullptr,
+ #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+                                  attemptCount, onRetry,
+ #endif
+-                                 transportPayloadCapability, fallbackResolveResult);
++                                 transportPayloadCapability, fallbackResolveResult, forceFreshAddressResolve);
+ }
+ 
+ void CASESessionManager::FindOrEstablishSession(const ScopedNodeId & peerId, Callback::Callback<OnDeviceConnected> * onConnection,
+@@ -96,7 +97,8 @@ void CASESessionManager::FindOrEstablishSessionHelper(const ScopedNodeId & peerI
+                                                       uint8_t attemptCount, Callback::Callback<OnDeviceConnectionRetry> * onRetry,
+ #endif
+                                                       TransportPayloadCapability transportPayloadCapability,
+-                                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult)
++                                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult,
++                                                      bool forceFreshAddressResolve)
+ {
+     ChipLogDetail(CASESessionManager, "FindOrEstablishSession: PeerId = [%d:" ChipLogFormatX64 "]", peerId.GetFabricIndex(),
+                   ChipLogValueX64(peerId.GetNodeId()));
+@@ -141,6 +143,8 @@ void CASESessionManager::FindOrEstablishSessionHelper(const ScopedNodeId & peerI
+     }
+ #endif // CHIP_CONFIG_ENABLE_ADDRESS_RESOLVE_FALLBACK
+ 
++    session->SetForceFreshAddressResolution(forceFreshAddressResolve);
++
+     if (onFailure != nullptr)
+     {
+         session->Connect(onConnection, onFailure, transportPayloadCapability);
+diff --git a/src/app/CASESessionManager.h b/src/app/CASESessionManager.h
+index eac04cd38c..d71b100456 100644
+--- a/src/app/CASESessionManager.h
++++ b/src/app/CASESessionManager.h
+@@ -85,7 +85,8 @@ public:
+                                 uint8_t attemptCount = 1, Callback::Callback<OnDeviceConnectionRetry> * onRetry = nullptr,
+ #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+                                 TransportPayloadCapability transportPayloadCapability = TransportPayloadCapability::kMRPPayload,
+-                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional);
++                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional,
++                                bool forceFreshAddressResolve                                         = false);
+ 
+     /**
+      * Find an existing session for the given node ID or trigger a new session request.
+@@ -205,7 +206,8 @@ private:
+                                       uint8_t attemptCount, Callback::Callback<OnDeviceConnectionRetry> * onRetry,
+ #endif
+                                       TransportPayloadCapability transportPayloadCapability,
+-                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional);
++                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional,
++                                      bool forceFreshAddressResolve                                         = false);
+ 
+     CASESessionManagerConfig mConfig;
+ };
+diff --git a/src/app/OperationalSessionSetup.cpp b/src/app/OperationalSessionSetup.cpp
+index b7aa9c3616..53c9907428 100644
+--- a/src/app/OperationalSessionSetup.cpp
++++ b/src/app/OperationalSessionSetup.cpp
+@@ -208,11 +208,31 @@ void OperationalSessionSetup::UpdateDeviceData(const ResolveResult & result)
+     mTryingNextResultDueToSessionEstablishmentError     = false;
+ #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+ 
+-    if (mState == State::Uninitialized)
++    if (mState == State::Uninitialized || mState == State::SecureConnected)
+     {
+         return;
+     }
+ 
++    if (mState == State::Connecting)
++    {
++        if (mDeviceAddress == addr)
++        {
++            return;
++        }
++
++        char oldAddress[Transport::PeerAddress::kMaxToStringSize];
++        char newAddress[Transport::PeerAddress::kMaxToStringSize];
++        mDeviceAddress.ToString(oldAddress);
++        addr.ToString(newAddress);
++        ChipLogProgress(Discovery,
++                        "OperationalSessionSetup[%u:" ChipLogFormatX64
++                        "]: Received updated address %s while connecting to %s; restarting CASE with the updated address",
++                        mPeerId.GetFabricIndex(), ChipLogValueX64(mPeerId.GetNodeId()), newAddress, oldAddress);
++
++        // Discard the in-progress CASE exchange before trying the fresh address.
++        MoveToState(State::ResolvingAddress);
++    }
++
+ #if CHIP_DETAIL_LOGGING
+     char peerAddrBuff[Transport::PeerAddress::kMaxToStringSize];
+     addr.ToString(peerAddrBuff);
+@@ -277,6 +297,24 @@ void OperationalSessionSetup::UpdateDeviceData(const ResolveResult & result)
+ #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+     mTryingNextResultDueToSessionEstablishmentError = tryingNextResultDueToSessionEstablishmentError;
+ #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
++
++    const bool cachedAddressFailed =
++        result.isFromCache && (err == CHIP_ERROR_INVALID_ADDRESS || CHIP_CONFIG_IsPlatformErrorNonCritical(err));
++    if (cachedAddressFailed)
++    {
++        CHIP_ERROR markError = Resolver::Instance().MarkCachedResultUnusable(mAddressLookupHandle);
++        if (markError == CHIP_NO_ERROR)
++        {
++            ChipLogProgress(Discovery,
++                            "Cached address for " ChipLogFormatScopedNodeId " was unusable (%" CHIP_ERROR_FORMAT
++                            "); continuing fresh address discovery",
++                            ChipLogValueScopedNodeId(mPeerId), err.Format());
++            return;
++        }
++
++        ChipLogError(Discovery, "Failed to continue fresh address discovery: %" CHIP_ERROR_FORMAT, markError.Format());
++    }
++
+     if (CHIP_NO_ERROR == Resolver::Instance().TryNextResult(mAddressLookupHandle))
+     {
+         // No need to NotifyRetryHandlers, since we never actually spent any
+@@ -626,6 +664,7 @@ CHIP_ERROR OperationalSessionSetup::LookupPeerAddress()
+     PeerId peerId(fabricInfo->GetCompressedFabricId(), mPeerId.GetNodeId());
+ 
+     NodeLookupRequest request(peerId);
++    request.SetForceRefresh(mForceFreshAddressResolution);
+ 
+     CHIP_ERROR err = Resolver::Instance().LookupNode(request, mAddressLookupHandle);
+ 
+diff --git a/src/app/OperationalSessionSetup.h b/src/app/OperationalSessionSetup.h
+index b134705e99..a5aaf0a27a 100644
+--- a/src/app/OperationalSessionSetup.h
++++ b/src/app/OperationalSessionSetup.h
+@@ -292,6 +292,12 @@ public:
+     void SetFallbackResolveResult(const AddressResolve::ResolveResult & result);
+ #endif // CHIP_CONFIG_ENABLE_ADDRESS_RESOLVE_FALLBACK
+ 
++    /**
++     * Require a fresh DNS-SD answer, when possible, for the next operational
++     * address lookup. This should be called before Connect().
++     */
++    void SetForceFreshAddressResolution(bool value) { mForceFreshAddressResolution = value; }
++
+ private:
+     enum class State : uint8_t
+     {
+@@ -326,7 +332,8 @@ private:
+     /// This is used when a node address is required.
+     chip::AddressResolve::NodeLookupHandle mAddressLookupHandle;
+ 
+-    State mState = State::Uninitialized;
++    State mState                      = State::Uninitialized;
++    bool mForceFreshAddressResolution = false;
+ 
+     bool mPerformingAddressUpdate = false;
+ 
+diff --git a/src/controller/CHIPDeviceController.cpp b/src/controller/CHIPDeviceController.cpp
+index d5033a47d9..293d29b74c 100644
+--- a/src/controller/CHIPDeviceController.cpp
++++ b/src/controller/CHIPDeviceController.cpp
+@@ -3926,7 +3926,8 @@ void DeviceCommissioner::PerformCommissioningStep(DeviceProxy * proxy, Commissio
+ #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+             /* attemptCount = */ 3, &mOnDeviceConnectionRetryCallback,
+ #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
+-            TransportPayloadCapability::kMRPPayload, mFallbackOperationalResolveResult);
++            TransportPayloadCapability::kMRPPayload, mFallbackOperationalResolveResult,
++            /* forceFreshAddressResolve = */ step == CommissioningStage::kFindOperationalForStayActive);
+     }
+     break;
+     case CommissioningStage::kPrimaryOperationalNetworkFailed: {
+diff --git a/src/lib/address_resolve/AddressResolve.h b/src/lib/address_resolve/AddressResolve.h
+index 1e45ffed5d..67d2ce6dcf 100644
+--- a/src/lib/address_resolve/AddressResolve.h
++++ b/src/lib/address_resolve/AddressResolve.h
+@@ -36,6 +36,7 @@ struct ResolveResult
+     bool supportsTcpServer   = false;
+     bool supportsTcpClient   = false;
+     bool isICDOperatingAsLIT = false;
++    bool isFromCache         = false;
+ 
+     ResolveResult() : address(Transport::Type::kUdp), mrpRemoteConfig(GetDefaultMRPConfig()) {}
+ };
+@@ -47,8 +48,10 @@ public:
+     NodeListener()          = default;
+     virtual ~NodeListener() = default;
+ 
+-    /// Callback executed once only for a lookup, when the final address of a
+-    /// node is considered to be the best choice for reachability.
++    /// Callback executed when an address of a node is considered usable.
++    ///
++    /// For a forced-refresh lookup this may be called first with a cached
++    /// address and then again if a different fresh address is discovered.
+     ///
+     /// The callback is expected to be executed within the CHIP event loop
+     /// thread.
+@@ -105,6 +108,16 @@ public:
+     const PeerId & GetPeerId() const { return mPeerId; }
+     System::Clock::Milliseconds32 GetMinLookupTime() const { return mMinLookupTimeMs; }
+     System::Clock::Milliseconds32 GetMaxLookupTime() const { return mMaxLookupTimeMs; }
++    bool GetForceRefresh() const { return mForceRefresh; }
++
++    /// Prefer a fresh network answer. A cached answer may be delivered first
++    /// so callers can start connecting immediately, followed by a fresh answer
++    /// if the network result differs.
++    NodeLookupRequest & SetForceRefresh(bool value)
++    {
++        mForceRefresh = value;
++        return *this;
++    }
+ 
+     /// The minimum lookup time is how much to wait for additional DNSSD
+     /// queries even if a reply has already been received or to allow for
+@@ -155,6 +168,7 @@ private:
+     PeerId mPeerId;
+     System::Clock::Milliseconds32 mMinLookupTimeMs{ kMinLookupTimeMsDefault };
+     System::Clock::Milliseconds32 mMaxLookupTimeMs{ kMaxLookupTimeMsDefault };
++    bool mForceRefresh = false;
+ };
+ 
+ /// These things are expected to be defined by the implementation header.
+@@ -203,8 +217,10 @@ public:
+     /// Lookup handle to keep track of node resolution
+     ///
+     /// If this returns CHIP_NO_ERROR, the following is expected:
+-    ///   - exactly one of the listener OnNodeAddressResolved
+-    ///     or OnNodeAddressResolutionFailed will be called at a later time
++    ///   - at least one of the listener OnNodeAddressResolved
++    ///     or OnNodeAddressResolutionFailed will be called at a later time;
++    ///     forced-refresh lookups may report a cached result followed by a
++    ///     fresh result before the lookup becomes inactive
+     ///   - handle must NOT be destroyed while the lookup is in progress (it
+     ///     is part of an internal 'lookup list')
+     ///   - handle must NOT be reused (the lookup is done on a per-node basis
+@@ -238,6 +254,17 @@ public:
+     /// This method may return other errors in some cases.
+     virtual CHIP_ERROR TryNextResult(Impl::NodeLookupHandle & handle) = 0;
+ 
++    /// Marks a cached result from a forced-refresh lookup as unusable.
++    ///
++    /// The lookup remains active so it can continue waiting for a fresh DNS-SD
++    /// result. The normal maximum lookup timeout is restored, so the lookup
++    /// still fails if no fresh result becomes available.
++    ///
++    /// This method must be called on an active handle that has already
++    /// delivered a cached result. It returns CHIP_ERROR_INCORRECT_STATE
++    /// otherwise.
++    virtual CHIP_ERROR MarkCachedResultUnusable(Impl::NodeLookupHandle & handle) = 0;
++
+     /// Stops an active lookup request.
+     ///
+     /// Caller controlls weather the `fail` callback of the handle is invoked or not by using
+diff --git a/src/lib/address_resolve/AddressResolve_DefaultImpl.cpp b/src/lib/address_resolve/AddressResolve_DefaultImpl.cpp
+index 4b60bbf6e5..3f5d9af585 100644
+--- a/src/lib/address_resolve/AddressResolve_DefaultImpl.cpp
++++ b/src/lib/address_resolve/AddressResolve_DefaultImpl.cpp
+@@ -32,9 +32,10 @@ static constexpr System::Clock::Timeout kInvalidTimeout{ System::Clock::Timeout:
+ 
+ void NodeLookupHandle::ResetForLookup(System::Clock::Timestamp now, const NodeLookupRequest & request)
+ {
+-    mRequestStartTime = now;
+-    mRequest          = request;
+-    mResults          = NodeLookupResults();
++    mRequestStartTime         = now;
++    mRequest                  = request;
++    mResults                  = NodeLookupResults();
++    mHasDeliveredCachedResult = false;
+ }
+ 
+ void NodeLookupHandle::LookupResult(const ResolveResult & result)
+@@ -88,6 +89,15 @@ System::Clock::Timeout NodeLookupHandle::NextEventTimeout(System::Clock::Timesta
+         return System::Clock::Timeout::zero();
+     }
+ 
++    if (HasDeliveredCachedResult())
++    {
++        // The platform continues refreshing the cache in the background. This
++        // lookup remains active until the session completes or explicitly
++        // cancels it, rather than stopping the refresh after the normal
++        // maximum lookup time.
++        return kInvalidTimeout;
++    }
++
+     if (elapsed < mRequest.GetMaxLookupTime())
+     {
+         return mRequest.GetMaxLookupTime() - elapsed;
+@@ -121,6 +131,10 @@ NodeLookupAction NodeLookupHandle::NextAction(System::Clock::Timestamp now)
+     // Give up if the maximum search time has been reached
+     if (elapsed >= mRequest.GetMaxLookupTime())
+     {
++        if (HasDeliveredCachedResult())
++        {
++            return NodeLookupAction::StopSearching();
++        }
+         return NodeLookupAction::Error(CHIP_ERROR_TIMEOUT);
+     }
+ 
+@@ -206,7 +220,7 @@ CHIP_ERROR Resolver::LookupNode(const NodeLookupRequest & request, Impl::NodeLoo
+ 
+     handle.ResetForLookup(mTimeSource.GetMonotonicTimestamp(), request);
+     auto & peerId = request.GetPeerId();
+-    ReturnErrorOnFailure(Dnssd::Resolver::Instance().ResolveNodeId(peerId));
++    ReturnErrorOnFailure(Dnssd::Resolver::Instance().ResolveNodeId(peerId, request.GetForceRefresh()));
+     mActiveLookups.PushBack(&handle);
+     ReArmTimer();
+     ChipLogProgress(Discovery, "Lookup started for " ChipLogFormatPeerId, ChipLogValuePeerId(peerId));
+@@ -228,6 +242,20 @@ CHIP_ERROR Resolver::TryNextResult(Impl::NodeLookupHandle & handle)
+     return CHIP_NO_ERROR;
+ }
+ 
++CHIP_ERROR Resolver::MarkCachedResultUnusable(Impl::NodeLookupHandle & handle)
++{
++    VerifyOrReturnError(mActiveLookups.Contains(&handle), CHIP_ERROR_INCORRECT_STATE);
++    VerifyOrReturnError(handle.HasDeliveredCachedResult(), CHIP_ERROR_INCORRECT_STATE);
++
++    handle.MarkCachedResultUnusable();
++
++    ChipLogProgress(Discovery, "Cached address rejected for " ChipLogFormatPeerId "; continuing fresh address discovery",
++                    ChipLogValuePeerId(handle.GetRequest().GetPeerId()));
++
++    ReArmTimer();
++    return CHIP_NO_ERROR;
++}
++
+ CHIP_ERROR Resolver::CancelLookup(Impl::NodeLookupHandle & handle, FailureCallback cancel_method)
+ {
+     VerifyOrReturnError(handle.IsActive(), CHIP_ERROR_INVALID_ARGUMENT);
+@@ -312,6 +340,7 @@ void Resolver::OnOperationalNodeResolved(const Dnssd::ResolvedNodeData & nodeDat
+         result.mrpRemoteConfig   = nodeData.resolutionData.GetRemoteMRPConfig();
+         result.supportsTcpClient = nodeData.resolutionData.supportsTcpClient;
+         result.supportsTcpServer = nodeData.resolutionData.supportsTcpServer;
++        result.isFromCache       = nodeData.resolutionData.isFromCache;
+ 
+         if (nodeData.resolutionData.isICDOperatingAsLIT.has_value())
+         {
+@@ -348,8 +377,20 @@ void Resolver::HandleAction(IntrusiveList<NodeLookupHandle>::Iterator & current)
+     }
+ 
+     // final result, handle either success or failure
+-    const PeerId peerId     = current->GetRequest().GetPeerId();
+-    NodeListener * listener = current->GetListener();
++    const PeerId peerId                 = current->GetRequest().GetPeerId();
++    NodeListener * listener             = current->GetListener();
++    const bool hasDeliveredCachedResult = current->HasDeliveredCachedResult();
++
++    if (action.Type() == NodeLookupResult::kLookupSuccess && action.ResolveResult().isFromCache &&
++        current->GetRequest().GetForceRefresh())
++    {
++        ChipLogProgress(Discovery, "Delivered cached address while continuing fresh discovery for " ChipLogFormatPeerId,
++                        ChipLogValuePeerId(peerId));
++        current->MarkCachedResultDelivered();
++        listener->OnNodeAddressResolved(peerId, action.ResolveResult());
++        return;
++    }
++
+     mActiveLookups.Erase(current);
+ 
+     Dnssd::Resolver::Instance().NodeIdResolutionNoLongerNeeded(peerId);
+@@ -359,9 +400,14 @@ void Resolver::HandleAction(IntrusiveList<NodeLookupHandle>::Iterator & current)
+     // contain the active lookup data as a member (intrusive lists members)
+     switch (action.Type())
+     {
++    case NodeLookupResult::kStopSearching:
++        break;
+     case NodeLookupResult::kLookupError:
+-        MATTER_LOG_NODE_DISCOVERY_FAILED(&peerId, action.ErrorResult());
+-        listener->OnNodeAddressResolutionFailed(peerId, action.ErrorResult());
++        if (!hasDeliveredCachedResult)
++        {
++            MATTER_LOG_NODE_DISCOVERY_FAILED(&peerId, action.ErrorResult());
++            listener->OnNodeAddressResolutionFailed(peerId, action.ErrorResult());
++        }
+         break;
+     case NodeLookupResult::kLookupSuccess:
+         MATTER_LOG_NODE_DISCOVERED(Tracing::DiscoveryInfoType::kResolutionDone, &peerId, &action.ResolveResult());
+@@ -399,11 +445,17 @@ void Resolver::OnOperationalNodeResolutionFailed(const PeerId & peerId, CHIP_ERR
+             continue;
+         }
+ 
+-        NodeListener * listener = current->GetListener();
++        NodeListener * listener                 = current->GetListener();
++        const bool alreadyDeliveredCachedResult = current->HasDeliveredCachedResult();
+         mActiveLookups.Erase(current);
+ 
+         Dnssd::Resolver::Instance().NodeIdResolutionNoLongerNeeded(peerId);
+ 
++        if (alreadyDeliveredCachedResult)
++        {
++            continue;
++        }
++
+         // Failure callback only called after iterator was cleared:
+         // This allows failure handlers to deallocate structures that may
+         // contain the active lookup data as a member (intrusive lists members)
+diff --git a/src/lib/address_resolve/AddressResolve_DefaultImpl.h b/src/lib/address_resolve/AddressResolve_DefaultImpl.h
+index 5445b6d1b8..4f0a0c319f 100644
+--- a/src/lib/address_resolve/AddressResolve_DefaultImpl.h
++++ b/src/lib/address_resolve/AddressResolve_DefaultImpl.h
+@@ -31,6 +31,7 @@ inline constexpr uint8_t kNodeLookupResultsLen = CHIP_CONFIG_MDNS_RESOLVE_LOOKUP
+ enum class NodeLookupResult
+ {
+     kKeepSearching, // keep the current search active
++    kStopSearching, // final status: stop without notifying the listener
+     kLookupError,   // final status: error
+     kLookupSuccess, // final status: success
+ };
+@@ -51,6 +52,19 @@ struct NodeLookupResults
+         return results[consumed++];
+     }
+ 
++    /// Remove results that were already returned to the caller so they can be
++    /// considered again if a later, fresh DNS-SD answer contains the address.
++    void DiscardConsumedResults()
++    {
++        VerifyOrDie(consumed <= count);
++        for (uint8_t i = consumed; i < count; i++)
++        {
++            results[i - consumed] = results[i];
++        }
++        count -= consumed;
++        consumed = 0;
++    }
++
+ #if CHIP_DETAIL_LOGGING
+     void LogDetail() const
+     {
+@@ -82,6 +96,7 @@ public:
+         case NodeLookupResult::kLookupSuccess:
+             mResult.result = other.mResult.result;
+             break;
++        case NodeLookupResult::kStopSearching:
+         case NodeLookupResult::kKeepSearching:
+             // no data is important here
+             break;
+@@ -90,6 +105,7 @@ public:
+     }
+ 
+     static NodeLookupAction KeepSearching() { return NodeLookupAction(NodeLookupResult::kKeepSearching); }
++    static NodeLookupAction StopSearching() { return NodeLookupAction(NodeLookupResult::kStopSearching); }
+ 
+     static NodeLookupAction Error(CHIP_ERROR err)
+     {
+@@ -153,6 +169,14 @@ public:
+     /// Return the next valid lookup result.
+     ResolveResult TakeLookupResult() { return mResults.ConsumeResult(); }
+ 
++    void MarkCachedResultDelivered() { mHasDeliveredCachedResult = true; }
++    bool HasDeliveredCachedResult() const { return mHasDeliveredCachedResult; }
++    void MarkCachedResultUnusable()
++    {
++        mHasDeliveredCachedResult = false;
++        mResults.DiscardConsumedResults();
++    }
++
+     /// Return when the next timer (min or max lookup time) is required to
+     /// be triggered for this lookup handle
+     System::Clock::Timeout NextEventTimeout(System::Clock::Timestamp now);
+@@ -161,6 +185,7 @@ private:
+     NodeLookupResults mResults;
+     NodeLookupRequest mRequest; // active request to process
+     System::Clock::Timestamp mRequestStartTime;
++    bool mHasDeliveredCachedResult = false;
+ };
+ 
+ class Resolver : public ::chip::AddressResolve::Resolver, public Dnssd::OperationalResolveDelegate
+@@ -173,6 +198,7 @@ public:
+     CHIP_ERROR Init(System::Layer * systemLayer) override;
+     CHIP_ERROR LookupNode(const NodeLookupRequest & request, Impl::NodeLookupHandle & handle) override;
+     CHIP_ERROR TryNextResult(Impl::NodeLookupHandle & handle) override;
++    CHIP_ERROR MarkCachedResultUnusable(Impl::NodeLookupHandle & handle) override;
+     CHIP_ERROR CancelLookup(Impl::NodeLookupHandle & handle, FailureCallback cancel_method) override;
+     void Shutdown() override;
+ 
+diff --git a/src/lib/address_resolve/tests/TestAddressResolve_DefaultImpl.cpp b/src/lib/address_resolve/tests/TestAddressResolve_DefaultImpl.cpp
+index c4e9b269bf..051b5f8eaa 100644
+--- a/src/lib/address_resolve/tests/TestAddressResolve_DefaultImpl.cpp
++++ b/src/lib/address_resolve/tests/TestAddressResolve_DefaultImpl.cpp
+@@ -27,6 +27,7 @@
+ 
+ #include <functional>
+ #include <optional>
++#include <vector>
+ 
+ using namespace chip;
+ using namespace chip::AddressResolve;
+@@ -530,6 +531,11 @@ public:
+     void Shutdown() override {}
+     void SetOperationalDelegate(OperationalResolveDelegate * delegate) override {}
+     CHIP_ERROR ResolveNodeId(const PeerId & peerId) override { return ResolveNodeIdStatus; }
++    CHIP_ERROR ResolveNodeId(const PeerId & peerId, bool forceRefresh) override
++    {
++        mLastForceRefresh = forceRefresh;
++        return ResolveNodeIdStatus;
++    }
+     void NodeIdResolutionNoLongerNeeded(const PeerId & peerId) override {}
+     CHIP_ERROR StartDiscovery(DiscoveryType type, DiscoveryFilter filter, DiscoveryContext &) override
+     {
+@@ -546,6 +552,7 @@ public:
+     CHIP_ERROR InitStatus                  = CHIP_NO_ERROR;
+     CHIP_ERROR ResolveNodeIdStatus         = CHIP_NO_ERROR;
+     CHIP_ERROR DiscoverCommissionersStatus = CHIP_NO_ERROR;
++    bool mLastForceRefresh                 = false;
+ };
+ 
+ class TestAddressResolveDefaultImplWithSystemLayer : public ::testing::Test
+@@ -835,6 +842,189 @@ TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener,
+     EXPECT_EQ(expectedError, CHIP_ERROR_TIMEOUT);
+ }
+ 
++TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, PropagatesForceRefreshToDnssdResolver)
++{
++    chip::Dnssd::Resolver::SetInstance(mockResolver);
++
++    chip::AddressResolve::Impl::Resolver resolver;
++    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
++
++    AddressResolve::NodeLookupHandle handle;
++    auto request = NodeLookupRequest(chip::PeerId(1, 2));
++    request.SetForceRefresh(true);
++
++    EXPECT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
++    EXPECT_TRUE(mockResolver.mLastForceRefresh);
++
++    EXPECT_EQ(resolver.CancelLookup(handle, Resolver::FailureCallback::Skip), CHIP_NO_ERROR);
++}
++
++TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, DeliversCachedResultThenFreshResultForForcedRefresh)
++{
++    chip::Dnssd::Resolver::SetInstance(mockResolver);
++
++    chip::AddressResolve::Impl::Resolver resolver;
++    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
++
++    System::Clock::Internal::RAIIMockClock clock;
++    auto request = NodeLookupRequest(chip::PeerId(1, 2));
++    request.SetForceRefresh(true);
++    request.SetMinLookupTime(100_ms32);
++    request.SetMaxLookupTime(500_ms32);
++
++    AddressResolve::NodeLookupHandle handle;
++    ASSERT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
++
++    std::vector<Transport::PeerAddress> resolvedAddresses;
++    bool resolutionFailed = false;
++    mNodeListener.SetOnNodeAddressResolved(
++        [&resolvedAddresses](const PeerId &, const ResolveResult & result) { resolvedAddresses.push_back(result.address); });
++    mNodeListener.SetOnNodeAddressResolutionFailed([&resolutionFailed](const PeerId &, CHIP_ERROR) { resolutionFailed = true; });
++    handle.SetListener(&mNodeListener);
++
++    auto makeResolvedData = [&request](const Transport::PeerAddress & address, bool isFromCache) {
++        Dnssd::ResolvedNodeData resolvedData;
++        resolvedData.resolutionData.numIPs       = 1;
++        resolvedData.resolutionData.ipAddress[0] = address.GetIPAddress();
++        resolvedData.resolutionData.interfaceId  = address.GetInterface();
++        resolvedData.resolutionData.port         = address.GetPort();
++        resolvedData.resolutionData.isFromCache  = isFromCache;
++        resolvedData.operationalData.peerId      = request.GetPeerId();
++        return resolvedData;
++    };
++
++    auto cachedAddress = GetAddressWithLowScore(1);
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
++
++    clock.AdvanceMonotonic(150_ms64);
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
++
++    ASSERT_EQ(resolvedAddresses.size(), 1u);
++    EXPECT_EQ(resolvedAddresses[0], cachedAddress);
++    EXPECT_TRUE(handle.IsActive());
++
++    auto freshAddress = GetAddressWithLowScore(5);
++    resolver.OnOperationalNodeResolved(makeResolvedData(freshAddress, false));
++
++    ASSERT_EQ(resolvedAddresses.size(), 2u);
++    EXPECT_EQ(resolvedAddresses[1], freshAddress);
++    EXPECT_FALSE(handle.IsActive());
++    EXPECT_FALSE(resolutionFailed);
++}
++
++TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, CachedResultRejectionAcceptsFreshResultForSameAddress)
++{
++    chip::Dnssd::Resolver::SetInstance(mockResolver);
++
++    chip::AddressResolve::Impl::Resolver resolver;
++    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
++
++    System::Clock::Internal::RAIIMockClock clock;
++    auto request = NodeLookupRequest(chip::PeerId(1, 2));
++    request.SetForceRefresh(true);
++    request.SetMinLookupTime(100_ms32);
++    request.SetMaxLookupTime(500_ms32);
++
++    AddressResolve::NodeLookupHandle handle;
++    ASSERT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
++
++    std::vector<Transport::PeerAddress> resolvedAddresses;
++    bool resolutionFailed = false;
++    mNodeListener.SetOnNodeAddressResolved(
++        [&resolvedAddresses](const PeerId &, const ResolveResult & result) { resolvedAddresses.push_back(result.address); });
++    mNodeListener.SetOnNodeAddressResolutionFailed([&resolutionFailed](const PeerId &, CHIP_ERROR) { resolutionFailed = true; });
++    handle.SetListener(&mNodeListener);
++
++    auto makeResolvedData = [&request](const Transport::PeerAddress & address, bool isFromCache) {
++        Dnssd::ResolvedNodeData resolvedData;
++        resolvedData.resolutionData.numIPs       = 1;
++        resolvedData.resolutionData.ipAddress[0] = address.GetIPAddress();
++        resolvedData.resolutionData.interfaceId  = address.GetInterface();
++        resolvedData.resolutionData.port         = address.GetPort();
++        resolvedData.resolutionData.isFromCache  = isFromCache;
++        resolvedData.operationalData.peerId      = request.GetPeerId();
++        return resolvedData;
++    };
++
++    auto cachedAddress = GetAddressWithLowScore(1);
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
++    clock.AdvanceMonotonic(150_ms64);
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
++
++    ASSERT_EQ(resolvedAddresses.size(), 1u);
++    EXPECT_EQ(resolvedAddresses[0], cachedAddress);
++    EXPECT_TRUE(handle.IsActive());
++
++    ASSERT_EQ(resolver.MarkCachedResultUnusable(handle), CHIP_NO_ERROR);
++    EXPECT_TRUE(handle.IsActive());
++
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, false));
++
++    ASSERT_EQ(resolvedAddresses.size(), 2u);
++    EXPECT_EQ(resolvedAddresses[1], cachedAddress);
++    EXPECT_FALSE(handle.IsActive());
++    EXPECT_FALSE(resolutionFailed);
++}
++
++TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, RejectedCachedResultRestoresLookupTimeout)
++{
++    chip::Dnssd::Resolver::SetInstance(mockResolver);
++
++    chip::AddressResolve::Impl::Resolver resolver;
++    ASSERT_EQ(resolver.Init(&mSystemLayer), CHIP_NO_ERROR);
++
++    System::Clock::Internal::RAIIMockClock clock;
++    auto request = NodeLookupRequest(chip::PeerId(1, 2));
++    request.SetForceRefresh(true);
++    request.SetMinLookupTime(100_ms32);
++    request.SetMaxLookupTime(500_ms32);
++
++    System::Clock::Timeout timerDelay;
++    System::TimerCompleteCallback timerCallback = nullptr;
++    void * timerContext                         = nullptr;
++    mSystemLayer.mStartTimerCallback = [&timerDelay, &timerCallback, &timerContext](
++                                           System::Clock::Timeout delay, System::TimerCompleteCallback complete, void * context) {
++        timerDelay    = delay;
++        timerCallback = complete;
++        timerContext  = context;
++        return CHIP_NO_ERROR;
++    };
++
++    AddressResolve::NodeLookupHandle handle;
++    ASSERT_EQ(resolver.LookupNode(request, handle), CHIP_NO_ERROR);
++
++    bool resolutionFailed = false;
++    mNodeListener.SetOnNodeAddressResolutionFailed([&resolutionFailed](const PeerId &, CHIP_ERROR) { resolutionFailed = true; });
++    handle.SetListener(&mNodeListener);
++
++    auto makeResolvedData = [&request](const Transport::PeerAddress & address, bool isFromCache) {
++        Dnssd::ResolvedNodeData resolvedData;
++        resolvedData.resolutionData.numIPs       = 1;
++        resolvedData.resolutionData.ipAddress[0] = address.GetIPAddress();
++        resolvedData.resolutionData.interfaceId  = address.GetInterface();
++        resolvedData.resolutionData.port         = address.GetPort();
++        resolvedData.resolutionData.isFromCache  = isFromCache;
++        resolvedData.operationalData.peerId      = request.GetPeerId();
++        return resolvedData;
++    };
++
++    auto cachedAddress = GetAddressWithLowScore(1);
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
++    clock.AdvanceMonotonic(150_ms64);
++    resolver.OnOperationalNodeResolved(makeResolvedData(cachedAddress, true));
++
++    ASSERT_TRUE(handle.IsActive());
++    ASSERT_EQ(resolver.MarkCachedResultUnusable(handle), CHIP_NO_ERROR);
++    ASSERT_TRUE(timerCallback != nullptr);
++    EXPECT_EQ(timerDelay, 350_ms32);
++
++    clock.AdvanceMonotonic(400_ms64);
++    timerCallback(&mSystemLayer, timerContext);
++
++    EXPECT_TRUE(resolutionFailed);
++    EXPECT_FALSE(handle.IsActive());
++}
++
+ TEST_F(TestAddressResolveDefaultImplWithSystemLayerAndNodeListener, ResolverShutsDownAndClearsAllPendingLookups)
+ {
+     chip::AddressResolve::Impl::Resolver resolver;
+diff --git a/src/lib/dnssd/Discovery_ImplPlatform.cpp b/src/lib/dnssd/Discovery_ImplPlatform.cpp
+index cbd4f457c1..444ad3e459 100644
+--- a/src/lib/dnssd/Discovery_ImplPlatform.cpp
++++ b/src/lib/dnssd/Discovery_ImplPlatform.cpp
+@@ -361,6 +361,7 @@ void DiscoveryImplPlatform::HandleNodeIdResolve(void * context, DnssdService * r
+     nodeData.resolutionData.interfaceId = result->mInterface;
+     nodeData.resolutionData.port        = result->mPort;
+     nodeData.operationalData.peerId     = peerId;
++    nodeData.resolutionData.isFromCache = result->mIsFromCache;
+ 
+     size_t addressesFound = 0;
+     for (auto & ip : addresses)
+@@ -685,7 +686,7 @@ bool DiscoveryImplPlatform::IsInitialized()
+     return mState == State::kInitialized;
+ }
+ 
+-CHIP_ERROR DiscoveryImplPlatform::ResolveNodeId(const PeerId & peerId)
++CHIP_ERROR DiscoveryImplPlatform::ResolveNodeId(const PeerId & peerId, bool forceRefresh)
+ {
+     // Resolve requests can only be issued once DNSSD is initialized and there is
+     // no caching currently
+@@ -698,8 +699,9 @@ CHIP_ERROR DiscoveryImplPlatform::ResolveNodeId(const PeerId & peerId)
+ 
+     ReturnErrorOnFailure(MakeInstanceName(service.mName, sizeof(service.mName), peerId));
+     Platform::CopyString(service.mType, kOperationalServiceName);
+-    service.mProtocol    = DnssdServiceProtocol::kDnssdProtocolTcp;
+-    service.mAddressType = Inet::IPAddressType::kAny;
++    service.mProtocol     = DnssdServiceProtocol::kDnssdProtocolTcp;
++    service.mAddressType  = Inet::IPAddressType::kAny;
++    service.mForceRefresh = forceRefresh;
+ 
+     return ChipDnssdResolve(&service, Inet::InterfaceId::Null(), HandleNodeIdResolve, this);
+ }
+diff --git a/src/lib/dnssd/Discovery_ImplPlatform.h b/src/lib/dnssd/Discovery_ImplPlatform.h
+index d75b16a56f..a689edfa6d 100644
+--- a/src/lib/dnssd/Discovery_ImplPlatform.h
++++ b/src/lib/dnssd/Discovery_ImplPlatform.h
+@@ -52,7 +52,8 @@ public:
+ 
+     // Members that implement Resolver interface.
+     void SetOperationalDelegate(OperationalResolveDelegate * delegate) override { mOperationalDelegate = delegate; }
+-    CHIP_ERROR ResolveNodeId(const PeerId & peerId) override;
++    CHIP_ERROR ResolveNodeId(const PeerId & peerId) override { return ResolveNodeId(peerId, false); }
++    CHIP_ERROR ResolveNodeId(const PeerId & peerId, bool forceRefresh) override;
+     void NodeIdResolutionNoLongerNeeded(const PeerId & peerId) override;
+     CHIP_ERROR DiscoverCommissionableNodes(DiscoveryFilter filter, DiscoveryContext & context);
+     CHIP_ERROR DiscoverCommissioners(DiscoveryFilter filter, DiscoveryContext & context);
+diff --git a/src/lib/dnssd/Resolver.h b/src/lib/dnssd/Resolver.h
+index 28406e1dc7..dad7c58edb 100644
+--- a/src/lib/dnssd/Resolver.h
++++ b/src/lib/dnssd/Resolver.h
+@@ -151,6 +151,12 @@ public:
+      */
+     virtual CHIP_ERROR ResolveNodeId(const PeerId & peerId) = 0;
+ 
++    /**
++     * Requests resolution with control over use of the platform DNS-SD cache.
++     * Backends that support cache refresh should override this overload.
++     */
++    virtual CHIP_ERROR ResolveNodeId(const PeerId & peerId, bool /* forceRefresh */) { return ResolveNodeId(peerId); }
++
+     /*
+      * Notify the resolver that one of the consumers that called ResolveNodeId
+      * successfully no longer needs the resolution result (e.g. because it got
+diff --git a/src/lib/dnssd/Types.h b/src/lib/dnssd/Types.h
+index 158384ccdd..63ce6fbcd8 100644
+--- a/src/lib/dnssd/Types.h
++++ b/src/lib/dnssd/Types.h
+@@ -102,6 +102,7 @@ struct CommonResolutionData
+     char hostName[kHostNameMaxLength + 1] = {};
+     bool supportsTcpClient                = false;
+     bool supportsTcpServer                = false;
++    bool isFromCache                      = false;
+     std::optional<bool> isICDOperatingAsLIT;
+     std::optional<System::Clock::Milliseconds32> mrpRetryIntervalIdle;
+     std::optional<System::Clock::Milliseconds32> mrpRetryIntervalActive;
+@@ -144,6 +145,7 @@ struct CommonResolutionData
+         port                    = 0;
+         supportsTcpClient       = false;
+         supportsTcpServer       = false;
++        isFromCache             = false;
+         interfaceId             = Inet::InterfaceId::Null();
+         for (auto & addr : ipAddress)
+         {
+diff --git a/src/lib/dnssd/platform/Dnssd.h b/src/lib/dnssd/platform/Dnssd.h
+index 4ff8a04469..3b1810cbef 100644
+--- a/src/lib/dnssd/platform/Dnssd.h
++++ b/src/lib/dnssd/platform/Dnssd.h
+@@ -79,6 +79,10 @@ struct DnssdService
+     const char ** mSubTypes;
+     size_t mSubTypeSize;
+     std::optional<chip::Inet::IPAddress> mAddress;
++    // Request a network refresh instead of returning a cached resolve result.
++    bool mForceRefresh = false;
++    // Indicates that this result was supplied by the platform DNS-SD cache.
++    bool mIsFromCache = false;
+     // Time to live in seconds. Per rfc6762 section 10, because we have a hostname, our default TTL is 120 seconds
+     uint32_t mTtlSeconds = 120;
+ 
+diff --git a/src/platform/Darwin/dnssd/DnssdContexts.cpp b/src/platform/Darwin/dnssd/DnssdContexts.cpp
+index f8cc1311b1..17caac02ac 100644
+--- a/src/platform/Darwin/dnssd/DnssdContexts.cpp
++++ b/src/platform/Darwin/dnssd/DnssdContexts.cpp
+@@ -30,8 +30,9 @@ using namespace chip::Dnssd::Internal;
+ 
+ namespace {
+ 
+-constexpr uint8_t kDnssdKeyMaxSize          = 32;
+-constexpr uint8_t kDnssdTxtRecordMaxEntries = 20;
++constexpr uint8_t kDnssdKeyMaxSize                                   = 32;
++constexpr uint8_t kDnssdTxtRecordMaxEntries                          = 20;
++constexpr chip::System::Clock::Timeout kCachedAddressFallbackTimeout = chip::System::Clock::Seconds16(15);
+ 
+ std::string GetHostNameWithoutDomain(const char * hostnameWithDomain)
+ {
+@@ -539,8 +540,8 @@ void BrowseWithDelegateContext::OnBrowseRemove(const char * name, const char * t
+ 
+ ResolveContext::ResolveContext(void * cbContext, DnssdResolveCallback cb, chip::Inet::IPAddressType cbAddressType,
+                                const char * instanceNameToResolve, BrowseContext * browseCausingResolve,
+-                               std::shared_ptr<uint32_t> && consumerCounterToUse) :
+-    browseThatCausedResolve(browseCausingResolve)
++                               std::shared_ptr<uint32_t> && consumerCounterToUse, bool forceRefresh) :
++    browseThatCausedResolve(browseCausingResolve), mForceRefresh(forceRefresh)
+ {
+     type            = ContextType::Resolve;
+     context         = cbContext;
+@@ -551,8 +552,8 @@ ResolveContext::ResolveContext(void * cbContext, DnssdResolveCallback cb, chip::
+ }
+ 
+ ResolveContext::ResolveContext(DiscoverNodeDelegate * delegate, chip::Inet::IPAddressType cbAddressType,
+-                               const char * instanceNameToResolve, std::shared_ptr<uint32_t> && consumerCounterToUse) :
+-    browseThatCausedResolve(nullptr)
++                               const char * instanceNameToResolve, std::shared_ptr<uint32_t> && consumerCounterToUse,
++                               bool forceRefresh) : browseThatCausedResolve(nullptr), mForceRefresh(forceRefresh)
+ {
+     type            = ContextType::Resolve;
+     context         = delegate;
+@@ -700,7 +701,7 @@ void ResolveContext::DispatchSuccess()
+                             instanceName.c_str()));
+ }
+ 
+-CHIP_ERROR ResolveContext::OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address)
++CHIP_ERROR ResolveContext::OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address, bool fromCache)
+ {
+     // If we don't have any information about this interfaceId, just ignore the
+     // address, since it won't be usable anyway without things like the port.
+@@ -734,7 +735,22 @@ CHIP_ERROR ResolveContext::OnNewAddress(const InterfaceKey & interfaceKey, const
+         return CHIP_NO_ERROR;
+     }
+ 
+-    interfaces[interfaceKey].addresses.push_back(ip);
++    auto & interface = interfaces[interfaceKey];
++    if (fromCache)
++    {
++        interface.cachedAddresses.push_back(ip);
++        if (!mFirstCachedAddressInterface.HasValue())
++        {
++            mFirstCachedAddressInterface.SetValue(interfaceKey);
++        }
++        mLatestCachedAddressInterface.SetValue(interfaceKey);
++        StartCachedAddressFallbackTimer();
++    }
++    else
++    {
++        interface.cachedAddresses.clear();
++        interface.addresses.push_back(ip);
++    }
+ 
+     return CHIP_NO_ERROR;
+ }
+@@ -752,6 +768,72 @@ bool ResolveContext::HasAddress()
+     return false;
+ }
+ 
++bool ResolveContext::HasCachedAddress()
++{
++    for (auto & interface : interfaces)
++    {
++        if (interface.second.cachedAddresses.size())
++        {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++bool ResolveContext::PromoteLatestCachedAddress()
++{
++    VerifyOrReturnError(mLatestCachedAddressInterface.HasValue(), false);
++    auto interface = interfaces.find(mLatestCachedAddressInterface.Value());
++    VerifyOrReturnError(interface != interfaces.end(), false);
++    VerifyOrReturnError(!interface->second.cachedAddresses.empty(), false);
++
++    interface->second.addresses = std::move(interface->second.cachedAddresses);
++    return true;
++}
++
++void ResolveContext::StartCachedAddressFallbackTimer()
++{
++    VerifyOrReturn(!mCachedAddressFallbackTimerStarted);
++
++    CHIP_ERROR err = DeviceLayer::SystemLayer().StartTimer(kCachedAddressFallbackTimeout, OnCachedAddressFallbackTimeout, this);
++    if (err == CHIP_NO_ERROR)
++    {
++        mCachedAddressFallbackTimerStarted = true;
++    }
++    else
++    {
++        ChipLogError(Discovery, "Failed to start cached address fallback timer: %" CHIP_ERROR_FORMAT, err.Format());
++    }
++}
++
++void ResolveContext::CancelCachedAddressFallbackTimer()
++{
++    VerifyOrReturn(mCachedAddressFallbackTimerStarted);
++    DeviceLayer::SystemLayer().CancelTimer(OnCachedAddressFallbackTimeout, this);
++    mCachedAddressFallbackTimerStarted = false;
++}
++
++void ResolveContext::OnCachedAddressFallbackTimeout(System::Layer * systemLayer, void * appState)
++{
++    auto * self                              = static_cast<ResolveContext *>(appState);
++    self->mCachedAddressFallbackTimerStarted = false;
++
++    if (MdnsContexts::GetInstance().Has(self) != CHIP_NO_ERROR)
++    {
++        return;
++    }
++
++    if (self->HasAddress() || self->PromoteLatestCachedAddress())
++    {
++        ChipLogProgress(Discovery, "Mdns: Using cached address for %s after refresh timeout", self->instanceName.c_str());
++        TEMPORARY_RETURN_IGNORED self->Finalize();
++        return;
++    }
++
++    TEMPORARY_RETURN_IGNORED self->Finalize(CHIP_ERROR_TIMEOUT);
++}
++
+ void ResolveContext::OnNewInterface(uint32_t interfaceId, const char * fullname, const char * hostnameWithDomain, uint16_t port,
+                                     uint16_t txtLen, const unsigned char * txtRecord, bool isFromSRPResolve)
+ {
+diff --git a/src/platform/Darwin/dnssd/DnssdImpl.cpp b/src/platform/Darwin/dnssd/DnssdImpl.cpp
+index 57ebd1cc09..bd8b090063 100644
+--- a/src/platform/Darwin/dnssd/DnssdImpl.cpp
++++ b/src/platform/Darwin/dnssd/DnssdImpl.cpp
+@@ -258,16 +258,35 @@ static void OnGetAddrInfo(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t i
+     ReturnOnFailure(MdnsContexts::GetInstance().Has(sdCtx));
+     LogOnFailure(__func__, err);
+ 
++    const bool answeredFromCache = (flags & kDNSServiceFlagAnsweredFromCache) != 0;
++
++    bool cachedInterfaceChanged = false;
+     if (kDNSServiceErr_NoError == err)
+     {
+         InterfaceKey interfaceKey = { interfaceId, hostname, contextWithType->isSRPResolve };
+-        TEMPORARY_RETURN_IGNORED sdCtx->OnNewAddress(interfaceKey, address);
++        const bool fromCache      = sdCtx->mForceRefresh && answeredFromCache;
++        TEMPORARY_RETURN_IGNORED sdCtx->OnNewAddress(interfaceKey, address, fromCache);
++        cachedInterfaceChanged = fromCache && sdCtx->mFirstCachedAddressInterface.HasValue() &&
++            !(sdCtx->mLatestCachedAddressInterface.Value() == sdCtx->mFirstCachedAddressInterface.Value());
+     }
+ 
+     if (!(flags & kDNSServiceFlagsMoreComing))
+     {
+-        VerifyOrReturn(sdCtx->HasAddress(), TEMPORARY_RETURN_IGNORED sdCtx->Finalize(kDNSServiceErr_BadState));
+-        TEMPORARY_RETURN_IGNORED sdCtx->Finalize();
++        if (sdCtx->HasAddress())
++        {
++            sdCtx->CancelCachedAddressFallbackTimer();
++            TEMPORARY_RETURN_IGNORED sdCtx->Finalize();
++        }
++        else if (cachedInterfaceChanged && sdCtx->PromoteLatestCachedAddress())
++        {
++            ChipLogProgress(Discovery, "Mdns: Using updated cached address for %s", StringOrNullMarker(hostname));
++            sdCtx->CancelCachedAddressFallbackTimer();
++            TEMPORARY_RETURN_IGNORED sdCtx->Finalize();
++        }
++        else if (!sdCtx->mForceRefresh || !sdCtx->HasCachedAddress())
++        {
++            TEMPORARY_RETURN_IGNORED sdCtx->Finalize(kDNSServiceErr_BadState);
++        }
+     }
+ }
+ 
+@@ -282,14 +301,18 @@ static void GetAddrInfo(ResolveContext * sdCtx)
+             continue;
+         }
+ 
+-        auto interfaceId = interface.first.interfaceId;
+-        auto hostname    = interface.second.fullyQualifiedDomainName.c_str();
+-        auto sdRefCopy   = sdCtx->serviceRef; // Mandatory copy because of kDNSServiceFlagsShareConnection
++        auto interfaceId      = interface.first.interfaceId;
++        auto hostname         = interface.second.fullyQualifiedDomainName.c_str();
++        auto sdRefCopy        = sdCtx->serviceRef; // Mandatory copy because of kDNSServiceFlagsShareConnection
++        DNSServiceFlags flags = kDNSServiceFlagsShareConnection;
++        if (sdCtx->mForceRefresh && !interface.first.isSRPResult)
++        {
++            flags |= kDNSServiceFlagsForceMulticast;
++        }
+ 
+         ResolveContextWithType * contextWithType =
+             (interface.first.isSRPResult) ? &sdCtx->resolveContextWithSRPType : &sdCtx->resolveContextWithNonSRPType;
+-        auto err = DNSServiceGetAddrInfo(&sdRefCopy, kDNSServiceFlagsShareConnection, interfaceId, protocol, hostname,
+-                                         OnGetAddrInfo, contextWithType);
++        auto err = DNSServiceGetAddrInfo(&sdRefCopy, flags, interfaceId, protocol, hostname, OnGetAddrInfo, contextWithType);
+         VerifyOrReturn(kDNSServiceErr_NoError == err, TEMPORARY_RETURN_IGNORED sdCtx->Finalize(err));
+         interface.second.isDNSLookUpRequested = true;
+     }
+@@ -323,18 +346,23 @@ static void OnResolve(DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t inter
+ }
+ 
+ static CHIP_ERROR ResolveWithContext(ResolveContext * sdCtx, uint32_t interfaceId, const char * type, const char * name,
+-                                     const char * domain, ResolveContextWithType * contextWithType)
++                                     const char * domain, ResolveContextWithType * contextWithType, bool forceRefresh)
+ {
+     auto sdRef = sdCtx->serviceRef; // Mandatory copy because of kDNSServiceFlagsShareConnection
+ 
+-    auto err =
+-        DNSServiceResolve(&sdRef, kDNSServiceFlagsShareConnection, interfaceId, name, type, domain, OnResolve, contextWithType);
++    DNSServiceFlags flags = kDNSServiceFlagsShareConnection;
++    if (forceRefresh && strcmp(domain, kLocalDot) == 0)
++    {
++        flags |= kDNSServiceFlagsForceMulticast;
++    }
++
++    auto err = DNSServiceResolve(&sdRef, flags, interfaceId, name, type, domain, OnResolve, contextWithType);
+     VerifyOrReturnError(kDNSServiceErr_NoError == err, sdCtx->Finalize(err));
+     return CHIP_NO_ERROR;
+ }
+ 
+ static CHIP_ERROR Resolve(ResolveContext * sdCtx, uint32_t interfaceId, chip::Inet::IPAddressType addressType, const char * type,
+-                          const char * name, const char * domain)
++                          const char * name, const char * domain, bool forceRefresh)
+ {
+     ChipLogProgress(Discovery, "Resolve type=%s name=%s domain=%s interface=%" PRIu32, StringOrNullMarker(type),
+                     StringOrNullMarker(name), StringOrNullMarker(domain), interfaceId);
+@@ -353,12 +381,15 @@ static CHIP_ERROR Resolve(ResolveContext * sdCtx, uint32_t interfaceId, chip::In
+     // ResolveWithContext guarantees it will Finalize() on failure.
+     if (domain != nullptr)
+     {
+-        ReturnErrorOnFailure(ResolveWithContext(sdCtx, interfaceId, type, name, domain, &sdCtx->resolveContextWithNonSRPType));
++        ReturnErrorOnFailure(
++            ResolveWithContext(sdCtx, interfaceId, type, name, domain, &sdCtx->resolveContextWithNonSRPType, forceRefresh));
+     }
+     else
+     {
+-        ReturnErrorOnFailure(ResolveWithContext(sdCtx, interfaceId, type, name, kLocalDot, &sdCtx->resolveContextWithNonSRPType));
+-        ReturnErrorOnFailure(ResolveWithContext(sdCtx, interfaceId, type, name, kSRPDot, &sdCtx->resolveContextWithNonSRPType));
++        ReturnErrorOnFailure(
++            ResolveWithContext(sdCtx, interfaceId, type, name, kLocalDot, &sdCtx->resolveContextWithNonSRPType, forceRefresh));
++        ReturnErrorOnFailure(
++            ResolveWithContext(sdCtx, interfaceId, type, name, kSRPDot, &sdCtx->resolveContextWithNonSRPType, forceRefresh));
+     }
+ 
+     auto retval = MdnsContexts::GetInstance().Add(sdCtx);
+@@ -370,24 +401,25 @@ static CHIP_ERROR Resolve(ResolveContext * sdCtx, uint32_t interfaceId, chip::In
+ }
+ 
+ static CHIP_ERROR Resolve(void * context, DnssdResolveCallback callback, uint32_t interfaceId,
+-                          chip::Inet::IPAddressType addressType, const char * type, const char * name, const char * domain)
++                          chip::Inet::IPAddressType addressType, const char * type, const char * name, const char * domain,
++                          bool forceRefresh)
+ {
+     auto counterHolder = GetCounterHolder(name);
+-    auto sdCtx         = chip::Platform::New<ResolveContext>(context, callback, addressType, name,
+-                                                     BrowseContext::sContextDispatchingSuccess, std::move(counterHolder));
++    auto sdCtx         = chip::Platform::New<ResolveContext>(
++        context, callback, addressType, name, BrowseContext::sContextDispatchingSuccess, std::move(counterHolder), forceRefresh);
+     VerifyOrReturnError(nullptr != sdCtx, CHIP_ERROR_NO_MEMORY);
+ 
+-    return Resolve(sdCtx, interfaceId, addressType, type, name, domain);
++    return Resolve(sdCtx, interfaceId, addressType, type, name, domain, forceRefresh);
+ }
+ 
+ static CHIP_ERROR Resolve(DiscoverNodeDelegate * delegate, uint32_t interfaceId, chip::Inet::IPAddressType addressType,
+-                          const char * type, const char * name)
++                          const char * type, const char * name, bool forceRefresh)
+ {
+     auto counterHolder = GetCounterHolder(name);
+-    auto sdCtx         = chip::Platform::New<ResolveContext>(delegate, addressType, name, std::move(counterHolder));
++    auto sdCtx         = chip::Platform::New<ResolveContext>(delegate, addressType, name, std::move(counterHolder), forceRefresh);
+     VerifyOrReturnError(nullptr != sdCtx, CHIP_ERROR_NO_MEMORY);
+ 
+-    return Resolve(sdCtx, interfaceId, addressType, type, name, nullptr);
++    return Resolve(sdCtx, interfaceId, addressType, type, name, nullptr, forceRefresh);
+ }
+ 
+ } // namespace
+@@ -539,7 +571,8 @@ CHIP_ERROR ChipDnssdResolve(DnssdService * service, chip::Inet::InterfaceId inte
+         }
+     }
+ 
+-    return Resolve(context, callback, interfaceId, service->mAddressType, regtype.c_str(), service->mName, domain);
++    return Resolve(context, callback, interfaceId, service->mAddressType, regtype.c_str(), service->mName, domain,
++                   service->mForceRefresh);
+ }
+ 
+ CHIP_ERROR ChipDnssdResolve(DnssdService * service, chip::Inet::InterfaceId interface, DiscoverNodeDelegate * delegate)
+@@ -549,7 +582,7 @@ CHIP_ERROR ChipDnssdResolve(DnssdService * service, chip::Inet::InterfaceId inte
+ 
+     auto regtype     = GetFullType(service);
+     auto interfaceId = GetInterfaceId(interface);
+-    return Resolve(delegate, interfaceId, service->mAddressType, regtype.c_str(), service->mName);
++    return Resolve(delegate, interfaceId, service->mAddressType, regtype.c_str(), service->mName, service->mForceRefresh);
+ }
+ 
+ void ChipDnssdResolveNoLongerNeeded(const char * instanceName)
+diff --git a/src/platform/Darwin/dnssd/DnssdImpl.h b/src/platform/Darwin/dnssd/DnssdImpl.h
+index 0e70c75ffc..4c91f518f0 100644
+--- a/src/platform/Darwin/dnssd/DnssdImpl.h
++++ b/src/platform/Darwin/dnssd/DnssdImpl.h
+@@ -235,6 +235,7 @@ struct InterfaceInfo
+ 
+     DnssdService service;
+     std::vector<Inet::IPAddress> addresses;
++    std::vector<Inet::IPAddress> cachedAddresses;
+     std::string fullyQualifiedDomainName;
+     bool isDNSLookUpRequested = false;
+     bool HasAddresses() const { return addresses.size() != 0; };
+@@ -279,6 +280,10 @@ struct ResolveContext : public GenericContext
+     std::string instanceName;
+     std::shared_ptr<uint32_t> consumerCounter;
+     BrowseContext * const browseThatCausedResolve; // Can be null
++    bool mForceRefresh;
++    bool mCachedAddressFallbackTimerStarted = false;
++    Optional<InterfaceKey> mFirstCachedAddressInterface;
++    Optional<InterfaceKey> mLatestCachedAddressInterface;
+ 
+     ResolveContextWithType resolveContextWithSRPType    = { this, true };
+     ResolveContextWithType resolveContextWithNonSRPType = { this, false };
+@@ -286,15 +291,21 @@ struct ResolveContext : public GenericContext
+     // browseCausingResolve can be null.
+     ResolveContext(void * cbContext, DnssdResolveCallback cb, chip::Inet::IPAddressType cbAddressType,
+                    const char * instanceNameToResolve, BrowseContext * browseCausingResolve,
+-                   std::shared_ptr<uint32_t> && consumerCounterToUse);
++                   std::shared_ptr<uint32_t> && consumerCounterToUse, bool forceRefresh);
+     ResolveContext(DiscoverNodeDelegate * delegate, chip::Inet::IPAddressType cbAddressType, const char * instanceNameToResolve,
+-                   std::shared_ptr<uint32_t> && consumerCounterToUse);
++                   std::shared_ptr<uint32_t> && consumerCounterToUse, bool forceRefresh);
++    ~ResolveContext() override { CancelCachedAddressFallbackTimer(); }
+ 
+     void DispatchFailure(const char * errorStr, CHIP_ERROR err) override;
+     void DispatchSuccess() override;
+ 
+-    CHIP_ERROR OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address);
++    CHIP_ERROR OnNewAddress(const InterfaceKey & interfaceKey, const struct sockaddr * address, bool fromCache);
+     bool HasAddress();
++    bool HasCachedAddress();
++    bool PromoteLatestCachedAddress();
++    void StartCachedAddressFallbackTimer();
++    void CancelCachedAddressFallbackTimer();
++    static void OnCachedAddressFallbackTimeout(System::Layer * systemLayer, void * appState);
+ 
+     void OnNewInterface(uint32_t interfaceId, const char * fullname, const char * hostname, uint16_t port, uint16_t txtLen,
+                         const unsigned char * txtRecord, bool isSRPResult);
+diff --git a/src/platform/Linux/DnssdImpl.cpp b/src/platform/Linux/DnssdImpl.cpp
+index c0a144625c..3e91031f4b 100644
+--- a/src/platform/Linux/DnssdImpl.cpp
++++ b/src/platform/Linux/DnssdImpl.cpp
+@@ -146,6 +146,20 @@ namespace Dnssd {
+ 
+ MdnsAvahi MdnsAvahi::sInstance;
+ 
++MdnsAvahi::ResolveContext::~ResolveContext()
++{
++    if (mResolver != nullptr)
++    {
++        avahi_service_resolver_free(mResolver);
++        mResolver = nullptr;
++    }
++    if (mRefreshPollActive)
++    {
++        DeviceLayer::SystemLayer().CancelTimer(HandleRefreshPoll, reinterpret_cast<void *>(mNumber));
++        mRefreshPollActive = false;
++    }
++}
++
+ Poller::Poller()
+ {
+     mAvahiPoller.userdata         = this;
+@@ -904,7 +918,7 @@ void MdnsAvahi::StopResolve(const char * name)
+ 
+ CHIP_ERROR MdnsAvahi::Resolve(const char * name, const char * type, DnssdServiceProtocol protocol, Inet::IPAddressType addressType,
+                               Inet::IPAddressType transportType, Inet::InterfaceId interface, DnssdResolveCallback callback,
+-                              void * context)
++                              void * context, bool forceRefresh)
+ {
+     AvahiIfIndex avahiInterface     = static_cast<AvahiIfIndex>(interface.GetPlatformInterface());
+     ResolveContext * resolveContext = AllocateResolveContext();
+@@ -924,14 +938,22 @@ CHIP_ERROR MdnsAvahi::Resolve(const char * name, const char * type, DnssdService
+     }
+ 
+     Platform::CopyString(resolveContext->mName, name);
+-    resolveContext->mInterface   = avahiInterface;
+-    resolveContext->mTransport   = ToAvahiProtocol(transportType);
+-    resolveContext->mAddressType = ToAvahiProtocol(addressType);
+-    resolveContext->mFullType    = GetFullType(type, protocol);
++    resolveContext->mInterface    = avahiInterface;
++    resolveContext->mTransport    = ToAvahiProtocol(transportType);
++    resolveContext->mAddressType  = ToAvahiProtocol(addressType);
++    resolveContext->mFullType     = GetFullType(type, protocol);
++    resolveContext->mForceRefresh = forceRefresh;
++    if (forceRefresh)
++    {
++        // Avahi 0.8 has no public no-cache lookup flag. A multicast lookup
++        // always sends a live query after scanning the cache, so cached
++        // callbacks are ignored below while the live answer is awaited.
++        resolveContext->mLookupFlags = static_cast<AvahiLookupFlags>(AVAHI_LOOKUP_USE_MULTICAST);
++    }
+ 
+     resolveContext->mResolver =
+         avahi_service_resolver_new(mClient, avahiInterface, resolveContext->mTransport, name, resolveContext->mFullType.c_str(),
+-                                   nullptr, resolveContext->mAddressType, static_cast<AvahiLookupFlags>(0), HandleResolve,
++                                   nullptr, resolveContext->mAddressType, resolveContext->mLookupFlags, HandleResolve,
+                                    reinterpret_cast<void *>(resolveContext->mNumber));
+     // Otherwise the resolver will be freed in the callback
+     if (resolveContext->mResolver == nullptr)
+@@ -965,9 +987,9 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
+         {
+             ChipLogProgress(DeviceLayer, "Re-trying resolve");
+             avahi_service_resolver_free(resolver);
+-            context->mResolver = avahi_service_resolver_new(
+-                context->mInstance->mClient, context->mInterface, context->mTransport, context->mName, context->mFullType.c_str(),
+-                nullptr, context->mAddressType, static_cast<AvahiLookupFlags>(0), HandleResolve, userdata);
++            context->mResolver = avahi_service_resolver_new(context->mInstance->mClient, context->mInterface, context->mTransport,
++                                                            context->mName, context->mFullType.c_str(), nullptr,
++                                                            context->mAddressType, context->mLookupFlags, HandleResolve, userdata);
+             if (context->mResolver == nullptr)
+             {
+                 ChipLogError(DeviceLayer, "Avahi resolve failed on retry");
+@@ -981,6 +1003,7 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
+         break;
+     case AVAHI_RESOLVER_FOUND:
+         DnssdService result = {};
++        result.mIsFromCache = (flags & AVAHI_LOOKUP_RESULT_CACHED) != 0;
+ 
+         ChipLogProgress(DeviceLayer, "Avahi resolve found");
+ 
+@@ -1061,12 +1084,61 @@ void MdnsAvahi::HandleResolve(AvahiServiceResolver * resolver, AvahiIfIndex inte
+         {
+             context->mCallback(context->mContext, nullptr, Span<Inet::IPAddress>(), result_err);
+         }
++
++        if (context->mForceRefresh && result.mIsFromCache)
++        {
++            ChipLogProgress(Discovery, "Delivered cached Avahi result for %s; continuing multicast lookup for a fresh address",
++                            name);
++            if (!context->mRefreshPollActive)
++            {
++                auto timerFailure =
++                    DeviceLayer::SystemLayer().StartTimer(System::Clock::Milliseconds32(1000), HandleRefreshPoll, userdata);
++                if (timerFailure == CHIP_NO_ERROR)
++                {
++                    context->mRefreshPollActive = true;
++                }
++                else
++                {
++                    ChipLogError(Discovery, "Failed to schedule Avahi refresh poll");
++                }
++            }
++            return;
++        }
++
++        if (context->mRefreshPollActive)
++        {
++            DeviceLayer::SystemLayer().CancelTimer(HandleRefreshPoll, userdata);
++            context->mRefreshPollActive = false;
++        }
+         break;
+     }
+ 
+     sInstance.FreeResolveContext(handle);
+ }
+ 
++void MdnsAvahi::HandleRefreshPoll(System::Layer * layer, void * userdata)
++{
++    size_t handle            = reinterpret_cast<size_t>(userdata);
++    ResolveContext * context = sInstance.ResolveContextForHandle(handle);
++    if (context == nullptr)
++    {
++        return;
++    }
++
++    context->mRefreshPollActive = false;
++
++    avahi_service_resolver_free(context->mResolver);
++    context->mResolver = avahi_service_resolver_new(context->mInstance->mClient, context->mInterface, context->mTransport,
++                                                    context->mName, context->mFullType.c_str(), nullptr, context->mAddressType,
++                                                    context->mLookupFlags, HandleResolve, userdata);
++    if (context->mResolver == nullptr)
++    {
++        ChipLogError(Discovery, "Avahi refresh poll failed");
++        context->mCallback(context->mContext, nullptr, Span<Inet::IPAddress>(), CHIP_ERROR_INTERNAL);
++        sInstance.FreeResolveContext(handle);
++    }
++}
++
+ CHIP_ERROR ChipDnssdInit(DnssdAsyncReturnCallback initCallback, DnssdAsyncReturnCallback errorCallback, void * context)
+ {
+     return MdnsAvahi::GetInstance().Init(initCallback, errorCallback, context);
+@@ -1118,7 +1190,8 @@ CHIP_ERROR ChipDnssdResolve(DnssdService * browseResult, chip::Inet::InterfaceId
+     VerifyOrReturnError(browseResult != nullptr, CHIP_ERROR_INVALID_ARGUMENT);
+ 
+     return MdnsAvahi::GetInstance().Resolve(browseResult->mName, browseResult->mType, browseResult->mProtocol,
+-                                            browseResult->mAddressType, Inet::IPAddressType::kAny, interface, callback, context);
++                                            browseResult->mAddressType, Inet::IPAddressType::kAny, interface, callback, context,
++                                            browseResult->mForceRefresh);
+ }
+ 
+ void ChipDnssdResolveNoLongerNeeded(const char * instanceName)
+diff --git a/src/platform/Linux/DnssdImpl.h b/src/platform/Linux/DnssdImpl.h
+index f1de8dbf0b..5348e1d9b2 100644
+--- a/src/platform/Linux/DnssdImpl.h
++++ b/src/platform/Linux/DnssdImpl.h
+@@ -116,7 +116,7 @@ public:
+     CHIP_ERROR StopBrowse(intptr_t browseIdentifier);
+     CHIP_ERROR Resolve(const char * name, const char * type, DnssdServiceProtocol protocol, chip::Inet::IPAddressType addressType,
+                        chip::Inet::IPAddressType transportType, chip::Inet::InterfaceId interface, DnssdResolveCallback callback,
+-                       void * context);
++                       void * context, bool forceRefresh);
+     void StopResolve(const char * name);
+ 
+     Poller & GetPoller() { return mPoller; }
+@@ -150,16 +150,12 @@ private:
+         AvahiProtocol mAddressType;
+         std::string mFullType;
+         uint8_t mAttempts                = 0;
++        bool mForceRefresh               = false;
++        AvahiLookupFlags mLookupFlags    = static_cast<AvahiLookupFlags>(0);
++        bool mRefreshPollActive          = false;
+         AvahiServiceResolver * mResolver = nullptr;
+ 
+-        ~ResolveContext()
+-        {
+-            if (mResolver != nullptr)
+-            {
+-                avahi_service_resolver_free(mResolver);
+-                mResolver = nullptr;
+-            }
+-        }
++        ~ResolveContext();
+     };
+ 
+     MdnsAvahi() : mClient(nullptr) {}
+@@ -186,7 +182,7 @@ private:
+                               AvahiResolverEvent event, const char * name, const char * type, const char * domain,
+                               const char * host_name, const AvahiAddress * address, uint16_t port, AvahiStringList * txt,
+                               AvahiLookupResultFlags flags, void * userdata);
+-
++    static void HandleRefreshPoll(System::Layer * layer, void * userdata);
+     DnssdAsyncReturnCallback mInitCallback;
+     DnssdAsyncReturnCallback mErrorCallback;
+     void * mAsyncReturnContext;
