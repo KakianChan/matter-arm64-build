@@ -86,7 +86,9 @@ git -C "$SDK_ROOT" apply "$WORKSPACE/stale-cache.patch"
 cd "$SDK_ROOT"
 bash scripts/bootstrap.sh
 export PW_ENVIRONMENT_ROOT="$SDK_ROOT/.environment"
+set +u
 source scripts/activate.sh
+set -u
 
 gn_args=(
     'matter_log_json_payload_hex=true'
