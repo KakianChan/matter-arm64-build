@@ -1,69 +1,5 @@
-diff --git a/src/app/CASESessionManager.cpp b/src/app/CASESessionManager.cpp
-index dd2fdcd16b..4467f44d57 100644
---- a/src/app/CASESessionManager.cpp
-+++ b/src/app/CASESessionManager.cpp
-@@ -40,13 +40,14 @@ void CASESessionManager::FindOrEstablishSession(const ScopedNodeId & peerId, Cal
-                                                 uint8_t attemptCount, Callback::Callback<OnDeviceConnectionRetry> * onRetry,
- #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
-                                                 TransportPayloadCapability transportPayloadCapability,
--                                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult)
-+                                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult,
-+                                                bool forceFreshAddressResolve)
- {
-     FindOrEstablishSessionHelper(peerId, onConnection, onFailure, nullptr,
- #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
-                                  attemptCount, onRetry,
- #endif
--                                 transportPayloadCapability, fallbackResolveResult);
-+                                 transportPayloadCapability, fallbackResolveResult, forceFreshAddressResolve);
- }
- 
- void CASESessionManager::FindOrEstablishSession(const ScopedNodeId & peerId, Callback::Callback<OnDeviceConnected> * onConnection,
-@@ -96,7 +97,8 @@ void CASESessionManager::FindOrEstablishSessionHelper(const ScopedNodeId & peerI
-                                                       uint8_t attemptCount, Callback::Callback<OnDeviceConnectionRetry> * onRetry,
- #endif
-                                                       TransportPayloadCapability transportPayloadCapability,
--                                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult)
-+                                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult,
-+                                                      bool forceFreshAddressResolve)
- {
-     ChipLogDetail(CASESessionManager, "FindOrEstablishSession: PeerId = [%d:" ChipLogFormatX64 "]", peerId.GetFabricIndex(),
-                   ChipLogValueX64(peerId.GetNodeId()));
-@@ -141,6 +143,8 @@ void CASESessionManager::FindOrEstablishSessionHelper(const ScopedNodeId & peerI
-     }
- #endif // CHIP_CONFIG_ENABLE_ADDRESS_RESOLVE_FALLBACK
- 
-+    session->SetForceFreshAddressResolution(forceFreshAddressResolve);
-+
-     if (onFailure != nullptr)
-     {
-         session->Connect(onConnection, onFailure, transportPayloadCapability);
-diff --git a/src/app/CASESessionManager.h b/src/app/CASESessionManager.h
-index eac04cd38c..d71b100456 100644
---- a/src/app/CASESessionManager.h
-+++ b/src/app/CASESessionManager.h
-@@ -85,7 +85,8 @@ public:
-                                 uint8_t attemptCount = 1, Callback::Callback<OnDeviceConnectionRetry> * onRetry = nullptr,
- #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
-                                 TransportPayloadCapability transportPayloadCapability = TransportPayloadCapability::kMRPPayload,
--                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional);
-+                                const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional,
-+                                bool forceFreshAddressResolve                                         = false);
- 
-     /**
-      * Find an existing session for the given node ID or trigger a new session request.
-@@ -205,7 +206,8 @@ private:
-                                       uint8_t attemptCount, Callback::Callback<OnDeviceConnectionRetry> * onRetry,
- #endif
-                                       TransportPayloadCapability transportPayloadCapability,
--                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional);
-+                                      const Optional<AddressResolve::ResolveResult> & fallbackResolveResult = NullOptional,
-+                                      bool forceFreshAddressResolve                                         = false);
- 
-     CASESessionManagerConfig mConfig;
- };
 diff --git a/src/app/OperationalSessionSetup.cpp b/src/app/OperationalSessionSetup.cpp
-index b7aa9c3616..53c9907428 100644
+index b7aa9c3616..18f709b669 100644
 --- a/src/app/OperationalSessionSetup.cpp
 +++ b/src/app/OperationalSessionSetup.cpp
 @@ -208,11 +208,31 @@ void OperationalSessionSetup::UpdateDeviceData(const ResolveResult & result)
@@ -124,55 +60,18 @@ index b7aa9c3616..53c9907428 100644
      if (CHIP_NO_ERROR == Resolver::Instance().TryNextResult(mAddressLookupHandle))
      {
          // No need to NotifyRetryHandlers, since we never actually spent any
-@@ -626,6 +664,7 @@ CHIP_ERROR OperationalSessionSetup::LookupPeerAddress()
+@@ -626,6 +664,11 @@ CHIP_ERROR OperationalSessionSetup::LookupPeerAddress()
      PeerId peerId(fabricInfo->GetCompressedFabricId(), mPeerId.GetNodeId());
  
      NodeLookupRequest request(peerId);
-+    request.SetForceRefresh(mForceFreshAddressResolution);
++    // Always keep the lookup active for a fresh DNS-SD answer, even when an
++    // address was served from the platform cache. A cached address may be
++    // stale after the device moves networks, and accepting it as the final
++    // result leaves no active lookup available to discover the replacement.
++    request.SetForceRefresh(true);
  
      CHIP_ERROR err = Resolver::Instance().LookupNode(request, mAddressLookupHandle);
  
-diff --git a/src/app/OperationalSessionSetup.h b/src/app/OperationalSessionSetup.h
-index b134705e99..a5aaf0a27a 100644
---- a/src/app/OperationalSessionSetup.h
-+++ b/src/app/OperationalSessionSetup.h
-@@ -292,6 +292,12 @@ public:
-     void SetFallbackResolveResult(const AddressResolve::ResolveResult & result);
- #endif // CHIP_CONFIG_ENABLE_ADDRESS_RESOLVE_FALLBACK
- 
-+    /**
-+     * Require a fresh DNS-SD answer, when possible, for the next operational
-+     * address lookup. This should be called before Connect().
-+     */
-+    void SetForceFreshAddressResolution(bool value) { mForceFreshAddressResolution = value; }
-+
- private:
-     enum class State : uint8_t
-     {
-@@ -326,7 +332,8 @@ private:
-     /// This is used when a node address is required.
-     chip::AddressResolve::NodeLookupHandle mAddressLookupHandle;
- 
--    State mState = State::Uninitialized;
-+    State mState                      = State::Uninitialized;
-+    bool mForceFreshAddressResolution = false;
- 
-     bool mPerformingAddressUpdate = false;
- 
-diff --git a/src/controller/CHIPDeviceController.cpp b/src/controller/CHIPDeviceController.cpp
-index d5033a47d9..293d29b74c 100644
---- a/src/controller/CHIPDeviceController.cpp
-+++ b/src/controller/CHIPDeviceController.cpp
-@@ -3926,7 +3926,8 @@ void DeviceCommissioner::PerformCommissioningStep(DeviceProxy * proxy, Commissio
- #if CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
-             /* attemptCount = */ 3, &mOnDeviceConnectionRetryCallback,
- #endif // CHIP_DEVICE_CONFIG_ENABLE_AUTOMATIC_CASE_RETRIES
--            TransportPayloadCapability::kMRPPayload, mFallbackOperationalResolveResult);
-+            TransportPayloadCapability::kMRPPayload, mFallbackOperationalResolveResult,
-+            /* forceFreshAddressResolve = */ step == CommissioningStage::kFindOperationalForStayActive);
-     }
-     break;
-     case CommissioningStage::kPrimaryOperationalNetworkFailed: {
 diff --git a/src/lib/address_resolve/AddressResolve.h b/src/lib/address_resolve/AddressResolve.h
 index 1e45ffed5d..67d2ce6dcf 100644
 --- a/src/lib/address_resolve/AddressResolve.h

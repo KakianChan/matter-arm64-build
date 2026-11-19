@@ -6,6 +6,7 @@ SDK_COMMIT="e91ea83caae4adb1871aa4bbe93c4be2dd9e1abf"
 WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
 SDK_ROOT="$WORKSPACE/connectedhomeip"
 OUT_DIR="$SDK_ROOT/out/python-controller"
+TEST_OUT_DIR="$SDK_ROOT/out/address-resolve-tests"
 
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -116,6 +117,16 @@ ninja -j4 \
 artifact_dir="$WORKSPACE/artifact"
 mkdir -p "$artifact_dir"
 cp "$OUT_DIR/obj/src/controller/python/matter/_ChipDeviceCtrl.so" "$artifact_dir/"
+
+test_gn_args=(
+    "${gn_args[@]}"
+    'chip_build_tests=true'
+)
+gn --root="$SDK_ROOT" gen "$TEST_OUT_DIR" --args="${test_gn_args[*]}"
+ninja -j4 \
+    -C "$TEST_OUT_DIR" \
+    tests/TestAddressResolve_DefaultImpl
+"$TEST_OUT_DIR/tests/TestAddressResolve_DefaultImpl"
 
 strings "$artifact_dir/_ChipDeviceCtrl.so" | grep -F \
     "Cached address rejected for" >/dev/null
