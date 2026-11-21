@@ -1,6 +1,9 @@
 name: Build ARM64 chip-tool BlueZ retry
 
 on:
+  push:
+    branches:
+      - codex/bluez-connection-retry
   workflow_dispatch:
 
 permissions:
